@@ -1,0 +1,604 @@
+{
+  "name": "Automated Meeting Scheduler",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {
+          "q": "subject:(schedule a meeting) OR body:(schedule a meeting) is:unread"
+        }
+      },
+      "id": "0592e779-7a10-452d-a2bf-92fd5aafff9b",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1536,
+        96
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 1: EXTRACT MEETING DETAILS FROM EMAIL\n// ============================================================\nconst item = $input.first().json;\n\n// ------------------------------------------------------------------\n// STEP 1A: FIND THE SENDER EMAIL\n// Different n8n Gmail Trigger versions use different field names.\n// We check every known location before giving up.\n// ------------------------------------------------------------------\n\nfunction extractEmailAndName(raw) {\n  if (!raw) return null;\n\n  if (typeof raw === 'string' && raw.includes('@')) {\n    const angleMatch = raw.match(/^(.*?)\\s*<([^>\\s]+@[^>\\s]+)>\\s*$/);\n    if (angleMatch) {\n      const name  = angleMatch[1].trim().replace(/^[\"']|[\"']$/g, '');\n      const email = angleMatch[2].trim().toLowerCase();\n      return { email, name: name || email.split('@')[0] };\n    }\n    const plain = raw.trim().toLowerCase();\n    if (plain.includes('@')) {\n      return { email: plain, name: plain.split('@')[0] };\n    }\n  }\n\n  if (typeof raw === 'object' && raw !== null) {\n    // { value: [{ address, name }] }  — mailparser format\n    if (Array.isArray(raw.value) && raw.value[0]?.address) {\n      const v = raw.value[0];\n      return { email: v.address.toLowerCase(), name: v.name || v.address.split('@')[0] };\n    }\n    // { address, name }\n    if (raw.address) {\n      return { email: raw.address.toLowerCase(), name: raw.name || raw.address.split('@')[0] };\n    }\n    // { email, name }\n    if (raw.email) {\n      return { email: raw.email.toLowerCase(), name: raw.name || raw.email.split('@')[0] };\n    }\n    // recurse on .text\n    if (typeof raw.text === 'string') {\n      return extractEmailAndName(raw.text);\n    }\n  }\n\n  return null;\n}\n\n// All known field names across n8n Gmail Trigger versions\nconst candidates = [\n  item.from,\n  item.From,\n  item.fromEmail,\n  item.sender,\n  item.replyTo,\n];\n\nlet fromAddress = '';\nlet fromName    = 'Unknown';\n\nfor (const candidate of candidates) {\n  const result = extractEmailAndName(candidate);\n  if (result && result.email) {\n    fromAddress = result.email;\n    fromName    = result.name;\n    break;\n  }\n}\n\n// Last resort: scan Gmail raw payload headers (present in some trigger versions)\nif (!fromAddress) {\n  const headers =\n    item.payload?.headers ||\n    item.headers ||\n    [];\n  if (Array.isArray(headers)) {\n    const fromHeader = headers.find(\n      h => (h.name || h.key || '').toLowerCase() === 'from'\n    );\n    if (fromHeader) {\n      const result = extractEmailAndName(fromHeader.value || fromHeader.val || '');\n      if (result && result.email) {\n        fromAddress = result.email;\n        fromName    = result.name;\n      }\n    }\n  }\n}\n\n// Absolute fallback: scan every string value in the item for an email address\nif (!fromAddress) {\n  const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/;\n  const skip = new Set(['id', 'threadId', 'historyId', 'internalDate', 'labelIds']);\n  for (const [key, val] of Object.entries(item)) {\n    if (skip.has(key)) continue;\n    if (typeof val === 'string') {\n      const m = val.match(emailRegex);\n      if (m) {\n        fromAddress = m[0].toLowerCase();\n        fromName    = fromAddress.split('@')[0];\n        break;\n      }\n    }\n  }\n}\n\nif (!fromAddress) {\n  throw new Error(\n    'Could not find sender email in any known field. ' +\n    'Available keys: ' + Object.keys(item).join(', ')\n  );\n}\n\n// ------------------------------------------------------------------\n// STEP 1B: EXTRACT THE REST OF THE MEETING DETAILS\n// ------------------------------------------------------------------\nconst emailBody    = item.text || item.body || item.snippet || '';\nconst emailSubject = item.subject || item.Subject || '';\nconst emailId      = item.id || item.messageId || '';\nconst threadId     = item.threadId || '';\n\n// Duration (default 30 min)\nconst durationMatch = emailBody.match(/(\\d+)\\s*(hour|hr|minute|min)/i);\nlet durationMinutes = 30;\nif (durationMatch) {\n  durationMinutes = durationMatch[2].toLowerCase().startsWith('h')\n    ? parseInt(durationMatch[1]) * 60\n    : parseInt(durationMatch[1]);\n}\n\n// Attendee name (\"with John\" / \"meet John\")\nconst attendeeMatch = emailBody.match(\n  /(?:with|meet with|meeting with)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?)/\n);\nconst attendeeName = attendeeMatch ? attendeeMatch[1] : 'Team';\n\n// Topic (\"about X\" / \"regarding X\")\nconst topicMatch = emailBody.match(\n  /(?:about|regarding|re:|topic:|discuss)\\s+([^\\.\\n,]{3,60})/i\n);\nconst meetingTopic = topicMatch\n  ? topicMatch[1].trim()\n  : emailSubject.replace(/^(re:|fwd:|fw:|schedule a meeting\\s*[:\\-]?)\\s*/i, '').trim()\n    || 'General Meeting';\n\n// Preferred date keyword\nconst dateMatch = emailBody.match(\n  /\\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week|this week|\\d{1,2}[\\/\\-]\\d{1,2}(?:[\\/\\-]\\d{2,4})?)\\b/i\n);\nconst preferredDate = dateMatch ? dateMatch[1] : null;\n\n// Preferred time range (\"2pm to 4pm\" / \"14:00 - 16:00\")\nconst timeMatch = emailBody.match(\n  /(\\d{1,2}(?::\\d{2})?\\s*(?:am|pm))\\s*(?:to|-)\\s*(\\d{1,2}(?::\\d{2})?\\s*(?:am|pm))/i\n);\nconst preferredTimeStart = timeMatch ? timeMatch[1] : null;\nconst preferredTimeEnd   = timeMatch ? timeMatch[2] : null;\n\nreturn [{\n  json: {\n    requester_email:      fromAddress,\n    requester_name:       fromName,\n    attendee_name:        attendeeName,\n    meeting_topic:        meetingTopic,\n    duration_minutes:     durationMinutes,\n    preferred_date:       preferredDate,\n    preferred_time_start: preferredTimeStart,\n    preferred_time_end:   preferredTimeEnd,\n    timezone:             'Africa/Nairobi',\n    utc_offset:           '+03:00',\n    original_email_id:    emailId,\n    thread_id:            threadId,\n    original_subject:     emailSubject\n  }\n}];"
+      },
+      "id": "ff01b0a2-a37e-4dfc-87f2-12067bc6b282",
+      "name": "Extract Meeting Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 2: BUILD DATE RANGES FOR NEXT 3 BUSINESS DAYS\n// ============================================================\nconst input = $input.first().json;\nconst utcOffset = input.utc_offset || '+03:00';\nconst baseData  = { ...input };\n\nconst now = new Date();\nconst businessDays = [];\nlet dayOffset = 1;\n\nwhile (businessDays.length < 3) {\n  const checkDate = new Date(now);\n  checkDate.setDate(now.getDate() + dayOffset);\n  const dayOfWeek = checkDate.getDay();\n\n  if (dayOfWeek !== 0 && dayOfWeek !== 6) {\n    const yyyy = checkDate.getFullYear();\n    const mm   = String(checkDate.getMonth() + 1).padStart(2, '0');\n    const dd   = String(checkDate.getDate()).padStart(2, '0');\n    const dateStr = `${yyyy}-${mm}-${dd}`;\n\n    businessDays.push({\n      json: {\n        ...baseData,\n        check_date: dateStr,\n        time_min: `${dateStr}T08:00:00${utcOffset}`,\n        time_max: `${dateStr}T18:00:00${utcOffset}`\n      }\n    });\n  }\n  dayOffset++;\n  if (dayOffset > 14) break;\n}\n\nreturn businessDays;"
+      },
+      "id": "1322adbf-0270-4abd-b76b-4d225c7cc9fa",
+      "name": "Build Date Ranges",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1088,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "c2c160f7-9fbb-4b25-a743-72d1132e8a42",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -864,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list",
+          "cachedResultName": "primary"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $json.time_min }}",
+        "timeMax": "={{ $json.time_max }}",
+        "options": {}
+      },
+      "id": "f25c01d2-5ae6-4006-9c17-f7f65ede1147",
+      "name": "Get Calendar Events",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        -640,
+        96
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "jqpg0hsDOUacFIvd",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 3: FIND FREE SLOTS\n// ============================================================\nconst allItems = $input.all();\nif (!allItems.length) return [{ json: { no_slots: true, slots: [] } }];\n\nconst firstItem    = allItems[0].json;\nconst durationMins = parseInt(firstItem.duration_minutes) || 30;\nconst utcOffset    = firstItem.utc_offset || '+03:00';\n\n// Collect busy times from all calendar events\nconst busyPeriods = [];\nfor (const item of allItems) {\n  const ev = item.json;\n  if (!ev.start) continue;\n  const startStr = ev.start.dateTime || ev.start.date;\n  const endStr   = ev.end?.dateTime  || ev.end?.date;\n  if (!startStr) continue;\n  const startTs = new Date(startStr);\n  const endTs   = endStr ? new Date(endStr) : new Date(startTs.getTime() + 60 * 60000);\n  if (!isNaN(startTs.getTime())) busyPeriods.push({ start: startTs, end: endTs });\n}\n\nfunction toDisplay(date) {\n  return date.toLocaleString('en-KE', {\n    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',\n    hour: '2-digit', minute: '2-digit', hour12: true,\n    timeZone: 'Africa/Nairobi'\n  });\n}\n\n// Collect unique dates from batched items\nconst datesSet = new Set();\nfor (const item of allItems) {\n  if (item.json.check_date) datesSet.add(item.json.check_date);\n}\nconst dates = [...datesSet].sort();\n\nif (dates.length === 0) {\n  const now = new Date();\n  let offset = 1;\n  while (dates.length < 3) {\n    const d = new Date(now);\n    d.setDate(now.getDate() + offset);\n    if (d.getDay() !== 0 && d.getDay() !== 6) dates.push(d.toISOString().split('T')[0]);\n    offset++;\n    if (offset > 14) break;\n  }\n}\n\nconst allFreeSlots = [];\n\nfor (const dateStr of dates) {\n  if (allFreeSlots.length >= 3) break;\n\n  const workStartUTC = new Date(`${dateStr}T09:00:00${utcOffset}`);\n  const workEndUTC   = new Date(`${dateStr}T17:00:00${utcOffset}`);\n\n  const dayBusy = busyPeriods\n    .filter(b => b.start < workEndUTC && b.end > workStartUTC)\n    .sort((a, b) => a.start - b.start);\n\n  let cursor = new Date(workStartUTC);\n\n  while (cursor < workEndUTC && allFreeSlots.length < 3) {\n    const slotEnd = new Date(cursor.getTime() + durationMins * 60000);\n    if (slotEnd > workEndUTC) break;\n\n    const overlaps = dayBusy.some(b => cursor < b.end && slotEnd > b.start);\n\n    if (!overlaps) {\n      allFreeSlots.push({\n        start:   cursor.toISOString(),\n        end:     slotEnd.toISOString(),\n        display: toDisplay(cursor)\n      });\n      cursor = new Date(slotEnd.getTime() + 15 * 60000);\n    } else {\n      const blocking = dayBusy.find(b => cursor < b.end && slotEnd > b.start);\n      cursor = blocking\n        ? new Date(blocking.end.getTime())\n        : new Date(cursor.getTime() + 30 * 60000);\n    }\n  }\n}\n\nconst topSlots = allFreeSlots.slice(0, 3);\n\nif (topSlots.length === 0) {\n  return [{ json: { ...firstItem, no_slots: true, slots: [], slot_1: null, slot_2: null, slot_3: null } }];\n}\n\nreturn [{ json: {\n  ...firstItem,\n  no_slots: false,\n  slots: topSlots,\n  slot_1: topSlots[0] || null,\n  slot_2: topSlots[1] || null,\n  slot_3: topSlots[2] || null\n}}];"
+      },
+      "id": "42bac25b-8258-479a-a41f-0c1998e2b6c3",
+      "name": "Find Free Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "check_no_slots",
+              "leftValue": "={{ $json.no_slots }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5ad8b62b-9447-4fb9-b1af-e71dcd4eb217",
+      "name": "IF: No Slots Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.requester_email }}",
+        "subject": "=Re: {{ $json.original_subject }} — No availability found",
+        "message": "=<p>Hi {{ $json.requester_name }},</p><p>Thank you for reaching out about scheduling a meeting regarding <strong>{{ $json.meeting_topic }}</strong>.</p><p>Unfortunately, I have <strong>no available slots</strong> in the next 3 business days. I will be in touch with alternative dates shortly.</p><p>Apologies for the inconvenience!</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "5b42adfd-06ca-40b8-9099-8b4c90c2d48c",
+      "name": "Send No Availability Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        32,
+        0
+      ],
+      "webhookId": "15c598e0-6855-478c-9a92-4274e286899a",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 4: BUILD FORMATTED OPTIONS EMAIL HTML\n// ============================================================\nconst d = $input.first().json;\n\n// Pull meeting details directly from Extract Meeting Details\n// because they are lost after passing through the Calendar node\nconst prev = $('Extract Meeting Details').first().json;\n\nconst requester_name   = prev.requester_name   || 'there';\nconst meeting_topic    = prev.meeting_topic    || 'your meeting';\nconst duration_minutes = prev.duration_minutes || 30;\n\nconst slot1 = d.slot_1;\nconst slot2 = d.slot_2;\nconst slot3 = d.slot_3;\n\nlet rows = `\n  <tr>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold\">Option 1</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd\">${slot1.display}</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;text-align:center\"><strong style=\"color:#1a73e8\">Reply: CONFIRM 1</strong></td>\n  </tr>`;\n\nif (slot2) rows += `\n  <tr>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold\">Option 2</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd\">${slot2.display}</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;text-align:center\"><strong style=\"color:#1a73e8\">Reply: CONFIRM 2</strong></td>\n  </tr>`;\n\nif (slot3) rows += `\n  <tr>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;background:#f9f9f9;font-weight:bold\">Option 3</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd\">${slot3.display}</td>\n    <td style=\"padding:12px 16px;border:1px solid #ddd;text-align:center\"><strong style=\"color:#1a73e8\">Reply: CONFIRM 3</strong></td>\n  </tr>`;\n\nconst html = `<!DOCTYPE html><html><body style=\"font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto\">\n  <div style=\"background:#1a73e8;padding:20px;border-radius:8px 8px 0 0\">\n    <h2 style=\"color:#fff;margin:0\">&#128197; Meeting Request Received</h2>\n  </div>\n  <div style=\"border:1px solid #ddd;border-top:none;padding:24px;border-radius:0 0 8px 8px\">\n    <p>Hi <strong>${requester_name}</strong>,</p>\n    <p>Thanks for reaching out! Here are available time slots for your meeting about <strong>${meeting_topic}</strong> (${duration_minutes} minutes):</p>\n    <table style=\"width:100%;border-collapse:collapse;margin:20px 0\">\n      <thead><tr style=\"background:#1a73e8;color:#fff\">\n        <th style=\"padding:12px 16px;text-align:left\">Option</th>\n        <th style=\"padding:12px 16px;text-align:left\">Date &amp; Time (EAT)</th>\n        <th style=\"padding:12px 16px;text-align:center\">How to Confirm</th>\n      </tr></thead>\n      <tbody>${rows}</tbody>\n    </table>\n    <div style=\"background:#fff8e1;border-left:4px solid #ffc107;padding:12px 16px;margin:20px 0\">\n      <strong>How to confirm:</strong> Simply reply to this email with <strong>CONFIRM 1</strong>, <strong>CONFIRM 2</strong>, or <strong>CONFIRM 3</strong>.\n    </div>\n    <p>If none of these times work, please reply with your preferred date and time.</p>\n    <p style=\"color:#666;font-size:13px\">This is an automated scheduling system.</p>\n  </div>\n</body></html>`;\n\nreturn [{ json: { ...d, email_html: html, slots_json: JSON.stringify(d.slots) } }];"
+      },
+      "id": "70e09d2c-4651-4a31-9fe2-44f30db1c8e2",
+      "name": "Build Options Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Extract Meeting Details').first().json.requester_email }}",
+        "subject": "=Re: {{ $('Extract Meeting Details').first().json.original_subject }} — Please pick a meeting time",
+        "message": "={{ $json.email_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "706ddfd9-e10e-4492-af8c-d85791559a46",
+      "name": "Send Options Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        256,
+        192
+      ],
+      "webhookId": "a3a3f620-b9b1-4c9a-a902-a33b457fad92",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 5: SAVE SLOTS TO STATIC WORKFLOW DATA\n// ============================================================\nconst d = $input.first().json;\n\n// Pull requester fields directly from Extract Meeting Details\n// because they are lost after passing through the Calendar node\nconst prev = $('Extract Meeting Details').first().json;\n\nconst requester_email  = prev.requester_email  || '';\nconst requester_name   = prev.requester_name   || 'Unknown';\nconst meeting_topic    = prev.meeting_topic    || 'General Meeting';\nconst attendee_name    = prev.attendee_name    || 'Team';\nconst duration_minutes = prev.duration_minutes || 30;\nconst timezone         = prev.timezone         || 'Africa/Nairobi';\nconst original_subject = prev.original_subject || '';\n\nif (!requester_email) {\n  throw new Error('requester_email is still missing from Extract Meeting Details node');\n}\n\nconst staticData = $getWorkflowStaticData('global');\nconst key = 'slots_' + requester_email.replace(/[^a-zA-Z0-9]/g, '_');\n\nstaticData[key] = {\n  slots:            d.slots,\n  meeting_topic:    meeting_topic,\n  attendee_name:    attendee_name,\n  duration_minutes: duration_minutes,\n  timezone:         timezone,\n  requester_name:   requester_name,\n  requester_email:  requester_email,\n  original_subject: original_subject,\n  saved_at:         new Date().toISOString()\n};\nconsole.log('Saved slot key:', key);\nreturn [{ json: { ...d, slot_data_saved: true, storage_key: key } }];\nreturn [{ json: { ...d, slot_data_saved: true, storage_key: key } }];"
+      },
+      "id": "6ebee81d-6779-4954-86e8-61270171aec5",
+      "name": "Save Slots to Static Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {
+          "q": "(\"CONFIRM 1\" OR \"CONFIRM 2\" OR \"CONFIRM 3\") is:unread"
+        }
+      },
+      "id": "3eaf773c-205a-4112-894a-41e6ec2b36e1",
+      "name": "Gmail Trigger: Wait for Confirmation",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1536,
+        512
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 6: PARSE CONFIRMATION REPLY\n// ============================================================\nconst item = $input.first().json;\n\n// --- Robust from-field parser (handles all Gmail Trigger formats) ---\nfunction parseFrom(raw) {\n  if (!raw) return { email: '', name: '' };\n\n  if (typeof raw === 'string' && raw.includes('@')) {\n    const angleMatch = raw.match(/^(.*?)\\s*<([^>\\s]+@[^>\\s]+)>\\s*$/);\n    if (angleMatch) {\n      const name  = angleMatch[1].trim().replace(/^[\"']|[\"']$/g, '');\n      const email = angleMatch[2].trim().toLowerCase();\n      return { email, name: name || email.split('@')[0] };\n    }\n    const plain = raw.trim().toLowerCase();\n    if (plain.includes('@')) {\n      return { email: plain, name: plain.split('@')[0] };\n    }\n  }\n\n  if (typeof raw === 'object' && raw !== null) {\n    if (Array.isArray(raw.value) && raw.value[0]?.address) {\n      const v = raw.value[0];\n      return { email: v.address.toLowerCase(), name: v.name || v.address.split('@')[0] };\n    }\n    if (raw.address) return { email: raw.address.toLowerCase(), name: raw.name || raw.address.split('@')[0] };\n    if (raw.email)   return { email: raw.email.toLowerCase(),   name: raw.name || raw.email.split('@')[0] };\n    if (typeof raw.text === 'string') return parseFrom(raw.text);\n  }\n\n  return { email: '', name: '' };\n}\n\n// Try all known field names\nconst candidates = [item.from, item.From, item.fromEmail, item.sender, item.replyTo];\nlet fromAddress = '';\nlet fromName    = 'Unknown';\n\nfor (const c of candidates) {\n  const result = parseFrom(c);\n  if (result.email) { fromAddress = result.email; fromName = result.name; break; }\n}\n\n// Fallback: scan raw payload headers\nif (!fromAddress) {\n  const headers = item.payload?.headers || item.headers || [];\n  if (Array.isArray(headers)) {\n    const h = headers.find(h => (h.name || h.key || '').toLowerCase() === 'from');\n    if (h) { const r = parseFrom(h.value || h.val || ''); if (r.email) { fromAddress = r.email; fromName = r.name; } }\n  }\n}\n\n// Last resort: scan all string values for an email pattern\nif (!fromAddress) {\n  const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/;\n  for (const [key, val] of Object.entries(item)) {\n    if (typeof val === 'string') {\n      const m = val.match(emailRegex);\n      if (m) { fromAddress = m[0].toLowerCase(); fromName = fromAddress.split('@')[0]; break; }\n    }\n  }\n}\n\nconst emailBody    = item.text || item.snippet || item.body || '';\nconst emailSubject = item.subject || '';\nconst combined     = (emailSubject + ' ' + emailBody).toUpperCase();\n\nlet choice = null;\nif      (combined.match(/CONFIRM\\s*1|OPTION\\s*1|SLOT\\s*1|FIRST\\s*OPTION/))  choice = 1;\nelse if (combined.match(/CONFIRM\\s*2|OPTION\\s*2|SLOT\\s*2|SECOND\\s*OPTION/)) choice = 2;\nelse if (combined.match(/CONFIRM\\s*3|OPTION\\s*3|SLOT\\s*3|THIRD\\s*OPTION/))  choice = 3;\n\nif (!choice) {\n  return [{ json: {\n    parse_error:     true,\n    error_reason:    'Could not detect CONFIRM 1/2/3 in reply',\n    raw_body:        emailBody,\n    requester_email: fromAddress,\n    requester_name:  fromName\n  }}];\n}\n\nconst staticData = $getWorkflowStaticData('global');\nconst key    = 'slots_' + fromAddress.replace(/[^a-zA-Z0-9]/g, '_');\nconst stored = staticData[key];\n\nif (!stored || !stored.slots || stored.slots.length === 0) {\n  return [{ json: {\n    parse_error:     true,\n    error_reason:    'Stored slot data not found for this requester',\n    requester_email: fromAddress,\n    requester_name:  fromName\n  }}];\n}\n\nconst confirmedSlot = stored.slots[choice - 1];\nif (!confirmedSlot) {\n  return [{ json: {\n    parse_error:     true,\n    error_reason:    `Slot ${choice} does not exist`,\n    requester_email: fromAddress,\n    requester_name:  fromName\n  }}];\n}\nconsole.log('Looking up key:', key);\nconsole.log('All static keys:', Object.keys(staticData));\ndelete staticData[key];\n\nreturn [{ json: {\n  parse_error:      false,\n  choice_number:    choice,\n  confirmed_slot:   confirmedSlot,\n  requester_email:  fromAddress,\n  requester_name:   fromName,\n  meeting_topic:    stored.meeting_topic,\n  attendee_name:    stored.attendee_name,\n  duration_minutes: stored.duration_minutes,\n  timezone:         stored.timezone,\n  original_subject: stored.original_subject\n}}];"
+      },
+      "id": "2c6624ab-1d6a-428b-a515-67b2a6655c06",
+      "name": "Parse Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "check_parse_error",
+              "leftValue": "={{ $json.parse_error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "44dd25f2-2a06-4911-965b-95aadd3aa0d4",
+      "name": "IF: Parse Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1088,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.requester_email }}",
+        "subject": "Re: Meeting Confirmation — Clarification Needed",
+        "message": "=<p>Hi {{ $json.requester_email }},</p><p>I received your reply but could not identify your preferred time slot.</p><p>Please reply with one of the following:</p><ul><li><strong>CONFIRM 1</strong></li><li><strong>CONFIRM 2</strong></li><li><strong>CONFIRM 3</strong></li></ul><p>Thank you!</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "38617aa9-c112-476d-b57b-ad14f3dfaf14",
+      "name": "Send Clarification Request",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -864,
+        416
+      ],
+      "webhookId": "b5ebde3a-e0e0-47e8-affe-a795d2bbabc6",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list",
+          "cachedResultName": "primary"
+        },
+        "start": "={{ $json.confirmed_slot.start }}",
+        "end": "={{ $json.confirmed_slot.end }}",
+        "additionalFields": {
+          "attendees": "={{ $json.requester_email }}",
+          "description": "=Meeting scheduled via automated n8n scheduler.\n\nTopic: {{ $json.meeting_topic }}\nRequester: {{ $json.requester_name }} ({{ $json.requester_email }})\nDuration: {{ $json.duration_minutes }} minutes",
+          "sendUpdates": "all",
+          "summary": "={{ $json.meeting_topic }} with {{ $json.requester_name }}"
+        }
+      },
+      "id": "9b6dbbe7-15c4-4af5-a61e-e6dda8a139d7",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        -864,
+        608
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "jqpg0hsDOUacFIvd",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// STEP 7: EXTRACT MEET LINK & MERGE DATA\n// ============================================================\nconst calEvent = $input.first().json;\n\nconst meetLink =\n  calEvent.hangoutLink ||\n  calEvent.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri ||\n  calEvent.conferenceData?.entryPoints?.[0]?.uri ||\n  'No video link generated';\n\nconst eventLink = calEvent.htmlLink || '';\nconst eventId   = calEvent.id || '';\n\nconst prev = $('Parse Confirmation').first().json;\n\nreturn [{ json: {\n  event_id:         eventId,\n  event_link:       eventLink,\n  meet_link:        meetLink,\n  requester_email:  prev.requester_email,\n  requester_name:   prev.requester_name,\n  meeting_topic:    prev.meeting_topic,\n  attendee_name:    prev.attendee_name,\n  duration_minutes: prev.duration_minutes,\n  confirmed_slot:   prev.confirmed_slot,\n  timezone:         prev.timezone\n}}];"
+      },
+      "id": "1cca6642-b012-4030-97d7-34182160dbf6",
+      "name": "Extract Meet Link",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.requester_email }}",
+        "subject": "=✅ Meeting Confirmed: {{ $json.meeting_topic }}",
+        "message": "=<!DOCTYPE html><html><body style=\"font-family:Arial,sans-serif;color:#333;max-width:600px;margin:0 auto\"><div style=\"background:#0f9d58;padding:20px;border-radius:8px 8px 0 0\"><h2 style=\"color:#fff;margin:0\">&#9989; Meeting Confirmed!</h2></div><div style=\"border:1px solid #ddd;border-top:none;padding:24px;border-radius:0 0 8px 8px\"><p>Hi <strong>{{ $json.requester_name }}</strong>,</p><p>Your meeting has been successfully booked. Here are the details:</p><table style=\"width:100%;border-collapse:collapse;margin:20px 0\"><tr style=\"background:#f9f9f9\"><td style=\"padding:12px 16px;border:1px solid #ddd;font-weight:bold;width:35%\">&#128203; Topic</td><td style=\"padding:12px 16px;border:1px solid #ddd\">{{ $json.meeting_topic }}</td></tr><tr><td style=\"padding:12px 16px;border:1px solid #ddd;font-weight:bold\">&#128197; Date &amp; Time</td><td style=\"padding:12px 16px;border:1px solid #ddd\">{{ $json.confirmed_slot.display }}</td></tr><tr style=\"background:#f9f9f9\"><td style=\"padding:12px 16px;border:1px solid #ddd;font-weight:bold\">&#9201; Duration</td><td style=\"padding:12px 16px;border:1px solid #ddd\">{{ $json.duration_minutes }} minutes</td></tr><tr><td style=\"padding:12px 16px;border:1px solid #ddd;font-weight:bold\">&#127909; Meeting Link</td><td style=\"padding:12px 16px;border:1px solid #ddd\"><a href=\"{{ $json.meet_link }}\" style=\"color:#1a73e8\">Join Google Meet</a></td></tr><tr style=\"background:#f9f9f9\"><td style=\"padding:12px 16px;border:1px solid #ddd;font-weight:bold\">&#128197; Calendar</td><td style=\"padding:12px 16px;border:1px solid #ddd\"><a href=\"{{ $json.event_link }}\" style=\"color:#1a73e8\">View Calendar Event</a></td></tr></table><div style=\"background:#e8f5e9;border-left:4px solid #0f9d58;padding:12px 16px;margin:20px 0\">A Google Calendar invite has been sent to your email. Please accept it to add the meeting to your calendar.</div><p>Looking forward to speaking with you!</p><p style=\"color:#666;font-size:13px\">This is an automated confirmation from the meeting scheduler.</p></div></body></html>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "9eee4a81-c5a3-4c22-88aa-a716e61dd51d",
+      "name": "Send Confirmation Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -416,
+        608
+      ],
+      "webhookId": "0f393a9c-d697-4e40-8a94-271643a1f9f4",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "mjexY59HMVGpSeT0",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "text": "New meeting booked",
+        "otherOptions": {}
+      },
+      "id": "e1a0d2ee-1dce-4bd4-9daf-90fd40190605",
+      "name": "Slack: Notify Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        -192,
+        608
+      ],
+      "webhookId": "32a96870-fa21-4187-83ea-c8308178f1e2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract Meeting Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Meeting Details": {
+      "main": [
+        [
+          {
+            "node": "Build Date Ranges",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Date Ranges": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Get Calendar Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Calendar Events": {
+      "main": [
+        [
+          {
+            "node": "Find Free Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Free Slots": {
+      "main": [
+        [
+          {
+            "node": "IF: No Slots Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: No Slots Available?": {
+      "main": [
+        [
+          {
+            "node": "Send No Availability Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Options Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Options Email": {
+      "main": [
+        [
+          {
+            "node": "Send Options Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Options Email": {
+      "main": [
+        [
+          {
+            "node": "Save Slots to Static Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Trigger: Wait for Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Parse Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Confirmation": {
+      "main": [
+        [
+          {
+            "node": "IF: Parse Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Parse Error?": {
+      "main": [
+        [
+          {
+            "node": "Send Clarification Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Extract Meet Link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Meet Link": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation Email": {
+      "main": [
+        [
+          {
+            "node": "Slack: Notify Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "c35737de-b0fa-4234-9f7d-51e05de64172",
+  "meta": {
+    "instanceId": "d96534f22fd3be35e3ea757d14942fcd9539e67648b7769b48989aba9064a5bf"
+  },
+  "id": "vhGiyZ5p8iB66bHI",
+  "tags": []
+}
