@@ -115,9 +115,9 @@ MIT License - see [LICENSE](LICENSE) file for details
 
 ## Contact
 
-**Your Name** – [@yourtwitter](https://twitter.com/yourtwitter) – email@example.com
+**Stanslous Kimani** – stankimani82@gmail.com
 
-Project Link: [https://github.com/yourusername/automated-meeting-scheduler](https://github.com/yourusername/automated-meeting-scheduler)
+Project Link: [(https://github.com/yourusername/automated-meeting-scheduler](https://github.com/Stan-kimani/Automated-Meeting-Scheduler/edit/main/README.md))](https://github.com/Stan-kimani/Automated-Meeting-Scheduler/edit/main/README.md)
 
 ---
 
